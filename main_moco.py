@@ -36,6 +36,8 @@ import moco.optimizer
 
 import vits
 
+from MIMIC import MIMIC_Dataset
+
 
 torchvision_model_names = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -44,9 +46,15 @@ torchvision_model_names = sorted(name for name in torchvision_models.__dict__
 model_names = ['vit_small', 'vit_base', 'vit_conv_small', 'vit_conv_base'] + torchvision_model_names
 
 parser = argparse.ArgumentParser(description='MoCo ImageNet Pre-Training')
-parser.add_argument('data', metavar='DIR',
+parser.add_argument('--output_dir', default="checkpoints/vit_small/Pretrain/CXR8/scratch", type=str, help='Path to save logs and checkpoints.')
+parser.add_argument('--data', metavar='DIR',
                     help='path to dataset')
-parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
+parser.add_argument('--dataset_name', default='MIMIC', choices=['CHEX', 'CXR8', 'MIMIC', 'OCT', 'CovidxCT'],
+                    type=str, help='dset name')
+parser.add_argument('--large_img', default=False, type=bool, help="If original images are there.")
+parser.add_argument('--input_channels', default=3, type=int, help='input channel size for medical images. If True, then 2D image is repeated thrice.')
+parser.add_argument('--n_samples', default=None, type=int, help='Pre-training dataset size')   
+parser.add_argument('-a', '--arch', metavar='ARCH', default='vit_small',
                     choices=model_names,
                     help='model architecture: ' +
                         ' | '.join(model_names) +
@@ -57,27 +65,27 @@ parser.add_argument('--epochs', default=100, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=4096, type=int,
+parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N',
                     help='mini-batch size (default: 4096), this is the total '
                          'batch size of all GPUs on all nodes when '
                          'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--lr', '--learning-rate', default=0.6, type=float,
+parser.add_argument('--lr', '--learning-rate', default=0.0005, type=float,
                     metavar='LR', help='initial (base) learning rate', dest='lr')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
-parser.add_argument('--wd', '--weight-decay', default=1e-6, type=float,
+parser.add_argument('--wd', '--weight-decay', default=0.04, type=float,
                     metavar='W', help='weight decay (default: 1e-6)',
                     dest='weight_decay')
-parser.add_argument('-p', '--print-freq', default=10, type=int,
+parser.add_argument('-p', '--print-freq', default=20, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
-parser.add_argument('--world-size', default=-1, type=int,
+parser.add_argument('--world-size', default=1, type=int,
                     help='number of nodes for distributed training')
-parser.add_argument('--rank', default=-1, type=int,
+parser.add_argument('--rank', default=0, type=int,
                     help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+parser.add_argument('--dist-url', default="tcp://127.0.0.1:29500", type=str,
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
@@ -109,7 +117,7 @@ parser.add_argument('--stop-grad-conv1', action='store_true',
                     help='stop-grad after first conv, or patch embedding')
 
 # other upgrades
-parser.add_argument('--optimizer', default='lars', type=str,
+parser.add_argument('--optimizer', default='adamw', type=str,
                     choices=['lars', 'adamw'],
                     help='optimizer used (default: lars)')
 parser.add_argument('--warmup-epochs', default=10, type=int, metavar='N',
@@ -179,7 +187,7 @@ def main_worker(gpu, ngpus_per_node, args):
     print("=> creating model '{}'".format(args.arch))
     if args.arch.startswith('vit'):
         model = moco.builder.MoCo_ViT(
-            partial(vits.__dict__[args.arch], stop_grad_conv1=args.stop_grad_conv1),
+            partial(vits.__dict__[args.arch], stop_grad_conv1=args.stop_grad_conv1, in_chans=args.input_channels),
             args.moco_dim, args.moco_mlp_dim, args.moco_t)
     else:
         model = moco.builder.MoCo_ResNet(
@@ -219,7 +227,7 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         # AllGather/rank implementation in this code only supports DistributedDataParallel.
         raise NotImplementedError("Only DistributedDataParallel is supported.")
-    print(model) # print model after SyncBatchNorm
+    #print(model) # print model after SyncBatchNorm
 
     if args.optimizer == 'lars':
         optimizer = moco.optimizer.LARS(model.parameters(), args.lr,
@@ -254,9 +262,28 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+    if args.dataset_name in ['MIMIC']:
+        print("Using MIMIC mean and sd")
+        mean_value_1D = [0.5292]
+        std_value_1D = [0.2507]
+        mean_value_3D = [0.5292,0.5292,0.5292]
+        std_value_3D = [0.2507,0.2507,0.2507]
+    else:
+        print("Using general mean and sd")
+        mean_value_1D = [0.485]
+        std_value_1D = [0.229]
+        mean_value_3D = [0.485, 0.456, 0.406]
+        std_value_3D = [0.229, 0.224, 0.225]
+        
+    print(f"Using {args.input_channels} channels")
+    if (args.input_channels == 1) or (str(args.input_channels) == "1"):
+        normalize = transforms.Normalize(mean=mean_value_1D,
+                                     std=std_value_1D)
+    elif (args.input_channels) or (str(args.input_channels) == "3"):
+        normalize = transforms.Normalize(mean=mean_value_3D,
+                                     std=std_value_3D)
+    else:
+        raise ValueError(f"input_channels must be 1 or 3, not {args.input_channels}")
 
     # follow BYOL's augmentation recipe: https://arxiv.org/abs/2006.07733
     augmentation1 = [
@@ -284,36 +311,60 @@ def main_worker(gpu, ngpus_per_node, args):
         normalize
     ]
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        moco.loader.TwoCropsTransform(transforms.Compose(augmentation1), 
-                                      transforms.Compose(augmentation2)))
+    transform_wrapper = moco.loader.TwoCropsTransform(transforms.Compose(augmentation1), 
+                                        transforms.Compose(augmentation2))
+
+    if args.dataset_name != "MIMIC":
+        print(f"Loading data from {args.data}")
+        train_dataset = datasets.ImageFolder(
+            os.path.join(args.data, 'train'),
+            transform_wrapper
+        )
+    else:
+        print("Loading MIMIC data")
+        train_dataset = MIMIC_Dataset(datapath=args.data, transform=transform_wrapper, split="train", input_channels=args.input_channels, n_samples = args.n_samples, large_img=args.large_img)
 
     if args.distributed:
+        print("Getting distributed sampler")
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     else:
         train_sampler = None
 
+    print("Getting DataLoader")
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
+    print("Start training ...")
     for epoch in range(args.start_epoch, args.epochs):
+        start_time = time.time()
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
         train(train_loader, model, optimizer, scaler, summary_writer, epoch, args)
 
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank == 0): # only the first GPU saves checkpoint
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': model.state_dict(),
-                'optimizer' : optimizer.state_dict(),
-                'scaler': scaler.state_dict(),
-            }, is_best=False, filename='checkpoint_%04d.pth.tar' % epoch)
+        if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank == 0): # only the first GPU saves checkpoint
+            save_best = False
+            if save_best:
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.state_dict(),
+                    'optimizer' : optimizer.state_dict(),
+                    'scaler': scaler.state_dict(),
+                }, is_best=save_best, output_dir=args.output_dir, filename='checkpoint_%04d.pth.tar' % epoch)
+            else:
+                if (epoch == args.epochs) or (epoch == (args.epochs-1)) or (epoch == 0) or (epoch == args.start_epoch) or (epoch % 20 == 0):
+                    save_checkpoint({
+                        'epoch': epoch + 1,
+                        'arch': args.arch,
+                        'state_dict': model.state_dict(),
+                        'optimizer' : optimizer.state_dict(),
+                        'scaler': scaler.state_dict(),
+                    }, is_best=save_best, output_dir=args.output_dir, filename='checkpoint_%04d.pth.tar' % epoch)
+
+        print(f"Finished epoch {epoch} after {round((time.time()-start_time)/60,4)} min.")
 
     if args.rank == 0:
         summary_writer.close()
@@ -370,10 +421,14 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
             progress.display(i)
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    torch.save(state, filename)
+def save_checkpoint(state, is_best, output_dir, filename='checkpoint.pth.tar'):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    file_path = str(os.path.join(output_dir,filename))
+    torch.save(state, file_path)
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+        file_best = str(os.path.join(output_dir,'model_best.pth.tar'))
+        shutil.copyfile(file_path, file_best)
 
 
 class AverageMeter(object):
